@@ -22,6 +22,8 @@ python teams_unread_watcher.py --click-pos 100,900   # 在指定安全坐标双�
 python teams_unread_watcher.py --no-click       # 只抖动鼠标，不点击
 python teams_unread_watcher.py --no-open        # 不逐个点开会话，只记录会话摘要
 python teams_unread_watcher.py --output d:/unread.txt   # 指定输出文件
+python teams_unread_watcher.py --dump-tree d:/tree.txt  # 导出 Teams 控件树排查问题
+python teams_unread_watcher.py --window-title "Microsoft Teams"   # 强制指定窗口
 ```
 
 `Ctrl+C` 退出。把鼠标快速甩到屏幕左上角可触发 pyautogui 的紧急停止。
@@ -30,7 +32,11 @@ python teams_unread_watcher.py --output d:/unread.txt   # 指定输出文件
 
 1. **鼠标保活**：把光标移开 1 像素再移回来（不这样做系统不会认为有输入），
    然后连续点击两下。
-2. **唤醒 Teams**：Windows 上找到 Teams 主窗口，最小化则还原，然后激活置顶；
+2. **唤醒 Teams**：Windows 上**按进程名**（`ms-teams.exe` / `Teams.exe`）找主窗口，
+   最小化则还原，然后激活置顶。不按标题关键词匹配——标题里带 "teams" 的窗口太多，
+   比如编辑器打开 `teams_unread_watcher.py` 时就会被误判。进程名取不到时才退回
+   标题匹配（必须严格含 "Microsoft Teams"）。找不到窗口会列出所有顶层窗口的
+   标题和进程名，方便用 `--window-title` 手动指定。macOS 用 `osascript` 激活；
    macOS 用 `osascript` 激活；Linux 用 `wmctrl -a Teams`。
 3. **找未读会话**：遍历 Teams 窗口的 UI Automation 控件树，按控件名匹配
    “3 条未读”“2 unread”“new message”等中英文标记。
@@ -60,6 +66,11 @@ python teams_unread_watcher.py --output d:/unread.txt   # 指定输出文件
 - **双击位置**：默认在鼠标当前所在位置双击。如果光标停在某个按钮或链接上，
   这两下会真的点下去。建议先把光标放到桌面空白处，或用 `--click-pos X,Y`
   指定一个安全坐标。
+- **fail-safe**：pyautogui 在光标位于屏幕四角时会抛异常紧急停止。脚本会自动把
+  光标从角落挪进来几个像素再抖动，避免误触发；万一还是触发了，只跳过这一轮的
+  鼠标保活，不影响同一轮的 Teams 抓取。
+- **未读检测不生效时**：用 `--dump-tree d:/tree.txt` 导出控件树，在里面搜一下未读
+  会话那一行实际的控件名长什么样，再对照着改 `UNREAD_PATTERNS`。
 - **读取未读消息只支持 Windows**，因为依赖 Windows UI Automation。
   macOS / Linux 上脚本只会做鼠标保活和唤醒 Teams，并在 txt 里写一条说明。
 - **点开会话会把消息标记为已读**，这是 Teams 自身的行为。不想改变已读状态就用

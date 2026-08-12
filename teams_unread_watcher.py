@@ -62,11 +62,32 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 # 1. 鼠标操作
 # --------------------------------------------------------------------------- #
+def import_uiautomation():
+    """导入 uiautomation，失败时打印真实原因和当前解释器路径。
+
+    最常见的坑：pip 把包装到了 A 解释器，脚本却是用 B 解释器跑的。
+    所以这里一定要把 sys.executable 打出来。
+    """
+    try:
+        import uiautomation
+        return uiautomation
+    except ImportError as exc:
+        log(f"导入 uiautomation 失败：{exc}")
+        log(f"当前解释器：{sys.executable}")
+        log(f"请用同一个解释器安装：\"{sys.executable}\" -m pip install uiautomation")
+        return None
+    except Exception as exc:                       # comtypes 初始化失败等非 ImportError 情况
+        log(f"导入 uiautomation 时出错（包已安装但加载失败）：{type(exc).__name__}: {exc}")
+        log(f"当前解释器：{sys.executable}")
+        return None
+
+
 def load_pyautogui():
     try:
         import pyautogui
-    except ImportError:
-        log("未安装 pyautogui，鼠标操作被跳过（pip install pyautogui）")
+    except ImportError as exc:
+        log(f"导入 pyautogui 失败：{exc}")
+        log(f"请用同一个解释器安装：\"{sys.executable}\" -m pip install pyautogui")
         return None
     pyautogui.FAILSAFE = True   # 鼠标甩到屏幕左上角可紧急中止
     pyautogui.PAUSE = 0.05
@@ -99,10 +120,8 @@ def wiggle_and_double_click(pyautogui, click: bool = True, pos: tuple[int, int] 
 # --------------------------------------------------------------------------- #
 # 2. 唤醒 Teams 窗口
 # --------------------------------------------------------------------------- #
-def activate_teams_windows():
+def activate_teams_windows(auto):
     """Windows：找到 Teams 主窗口并激活置顶，返回窗口控件。"""
-    import uiautomation as auto
-
     for win in auto.GetRootControl().GetChildren():
         if win.ControlTypeName != "WindowControl":
             continue
@@ -318,12 +337,11 @@ def run_once(args, pyautogui, output_path: str) -> None:
     wiggle_and_double_click(pyautogui, click=not args.no_click, pos=args.click_pos)
 
     if IS_WINDOWS:
-        try:
-            import uiautomation  # noqa: F401
-        except ImportError:
-            log("未安装 uiautomation，无法读取 Teams 未读消息（pip install uiautomation）")
+        auto = import_uiautomation()
+        if auto is None:
+            log("无法读取 Teams 未读消息，本轮跳过。")
             return
-        teams_win = activate_teams_windows()
+        teams_win = activate_teams_windows(auto)
         if teams_win is None:
             return
         entries = collect_unread_windows(teams_win, open_each=not args.no_open)
@@ -365,6 +383,7 @@ def main() -> int:
     pyautogui = load_pyautogui()
 
     log(f"启动：间隔 {args.interval} 秒，输出文件 {output_path}")
+    log(f"当前解释器：{sys.executable}")
     if not args.no_click and args.click_pos is None:
         log("提示：将在鼠标当前位置双击，请先把光标移到空白区域，或用 --click-pos 指定坐标。")
 

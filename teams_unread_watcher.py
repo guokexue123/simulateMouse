@@ -106,6 +106,34 @@ def load_pyautogui():
     return pyautogui
 
 
+def safe_click_pos(pyautogui, avoid_rect: tuple[int, int, int, int] | None
+                   ) -> tuple[int, int] | None:
+    """光标落在 avoid_rect 里时，给一个该矩形之外的落点。
+
+    保活的双击如果点进 Teams 的会话列表，会切换选中项、弹出悬停菜单，
+    把要测量的界面搅乱——测量动作本身不能影响被测量的对象。
+    """
+    if avoid_rect is None:
+        return None
+    try:
+        x, y = pyautogui.position()
+        screen_w, screen_h = pyautogui.size()
+    except Exception:
+        return None
+
+    left, top, right, bottom = avoid_rect
+    if not (left <= x <= right and top <= y <= bottom):
+        return None                                 # 本来就在外面，不用挪
+
+    if left > 60:                                   # 窗口左边有空地，挪到那儿
+        return max(2, left // 2), min(max(y, 2), screen_h - 3)
+    if right < screen_w - 60:                       # 挪到窗口右边
+        return min(right + (screen_w - right) // 2, screen_w - 3), min(max(y, 2), screen_h - 3)
+    if bottom < screen_h - 40:                      # 窗口下方还有空间
+        return min(max(x, 2), screen_w - 3), min(bottom + 20, screen_h - 3)
+    return None                                     # 窗口几乎占满屏幕，只能作罢
+
+
 def wiggle_and_double_click(pyautogui, click: bool = True, pos: tuple[int, int] | None = None) -> None:
     """抖动鼠标 + 连续点击两下，用来保持机器唤醒状态。"""
     if pyautogui is None:
@@ -187,6 +215,19 @@ def looks_like_teams(win, title_override: str | None) -> bool:
         return pname in TEAMS_PROCESS_NAMES
     # 拿不到进程名才退回标题匹配。
     return bool(TEAMS_TITLE_PATTERN.search(title))
+
+
+def find_teams_window(auto, title_override: str | None = None):
+    """只查找 Teams 主窗口，不激活。需要先拿到窗口位置时用这个。"""
+    for win in auto.GetRootControl().GetChildren():
+        try:
+            if win.ControlTypeName != "WindowControl":
+                continue
+            if looks_like_teams(win, title_override):
+                return win
+        except Exception:
+            continue
+    return None
 
 
 def activate_teams_windows(auto, title_override: str | None = None):
@@ -373,6 +414,75 @@ NAME_SUFFIXES = ("有空", "离开", "忙碌", "请勿打扰", "通话中", "已
 
 # 列表里混进来的非会话项。
 NON_CHAT_NAMES = {"查看更多", "显示更多", "更多选项", "See more", "Show more", "更多"}
+
+# 左侧面板上的分组标题。只扫"聊天"这一组，收藏夹、频道等都不算。
+CHAT_SECTION_NAMES = ("聊天", "Chat", "Chats")
+OTHER_SECTION_NAMES = ("收藏夹", "Favorites", "频道", "Channels", "团队", "Teams",
+                       "会议", "Meetings", "最近", "Recent", "已固定", "Pinned")
+
+
+def is_section_header(name: str, names: tuple[str, ...]) -> bool:
+    """分组标题的名字就是"聊天"本身，可能带个展开箭头。"""
+    text = name.strip().strip("∨∧><›‹ ").strip()
+    return text in names
+
+
+def filter_to_section(items: list[dict], header_top: int,
+                      other_header_tops: list[int]) -> list[dict]:
+    """只保留"聊天"标题下方、且在下一个分组标题上方的那些会话项。
+
+    左侧面板上除了聊天还有收藏夹、频道等，不加限制会把它们一起扫进来，
+    每次展开/折叠还会让数量忽多忽少。
+    """
+    below = [top for top in other_header_tops if top > header_top]
+    section_bottom = min(below) if below else None
+
+    kept = []
+    for item in items:
+        rect = item.get("rect")
+        if rect is None:
+            continue
+        if rect[1] < header_top:                    # 在"聊天"标题上方
+            continue
+        if section_bottom is not None and rect[1] >= section_bottom:
+            continue                                # 已经进了下一个分组
+        if is_section_header(item["name"], CHAT_SECTION_NAMES + OTHER_SECTION_NAMES):
+            continue                                # 标题自己不是会话
+        kept.append(item)
+    return kept
+
+
+def dedupe_rows(items: list[dict]) -> list[dict]:
+    """去掉重叠的重复项。
+
+    嵌套容器会让同一行被收进来好几次（外层容器和内层容器都符合条件），
+    表现就是会话数莫名其妙翻倍。位置几乎重合的只保留最外层那个。
+    """
+    def area(rect):
+        return (rect[2] - rect[0]) * (rect[3] - rect[1]) if rect else 0
+
+    ordered = sorted(items, key=lambda it: -area(it.get("rect")))
+    kept: list[dict] = []
+    for item in ordered:
+        rect = item.get("rect")
+        if rect is None:
+            continue
+        duplicate = False
+        for other in kept:
+            box = other["rect"]
+            # 计算重叠面积占较小者的比例
+            overlap_w = min(rect[2], box[2]) - max(rect[0], box[0])
+            overlap_h = min(rect[3], box[3]) - max(rect[1], box[1])
+            if overlap_w <= 0 or overlap_h <= 0:
+                continue
+            smaller = min(area(rect), area(box)) or 1
+            if overlap_w * overlap_h / smaller > 0.8:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(item)
+    kept.sort(key=lambda it: it["rect"][1])         # 还原成从上到下的顺序
+    return kept
 
 
 def clean_chat_name(name: str) -> str:
@@ -692,6 +802,37 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
         candidates = collect(lambda n: looks_like_chat_row(rect_of(n), window_rect))
         how = "按几何形状"
 
+    # 先锚定到"聊天"分组：只扫这一组下面的会话，收藏夹、频道等一律不看。
+    chat_header_top = None
+    other_header_tops = []
+    for node, _depth in nodes:
+        try:
+            name = (node.Name or "").strip()
+        except Exception:
+            continue
+        if not name:
+            continue
+        rect = rect_of(node)
+        if rect is None or rect[0] >= window_rect[0] + (
+                window_rect[2] - window_rect[0]) * PANEL_DIVIDER:
+            continue                                # 只看左侧面板
+        if is_section_header(name, CHAT_SECTION_NAMES):
+            if chat_header_top is None or rect[1] < chat_header_top:
+                chat_header_top = rect[1]
+        elif is_section_header(name, OTHER_SECTION_NAMES):
+            other_header_tops.append(rect[1])
+
+    if chat_header_top is not None:
+        scoped = filter_to_section(candidates, chat_header_top, other_header_tops)
+        if scoped:
+            candidates = scoped
+            how += "，已限定在「聊天」分组内"
+        else:
+            log("找到了「聊天」标题，但它下面没有会话项，退回全窗口扫描。")
+    else:
+        log("没找到「聊天」分组标题，退回全窗口扫描。")
+
+    candidates = dedupe_rows(candidates)
     chat_items = pick_chat_list(candidates, window_rect)
     if not chat_items:
         chat_items = candidates                     # 挑不出来就退回全量，宁可多报
@@ -712,6 +853,9 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
                 sig = tuple(sorted(
                     sub.ControlTypeName
                     for sub, _d in _iter_controls(item["node"], max_depth=2, max_nodes=40)
+                    # 鼠标悬停会给那一行临时加上"⋯"菜单按钮，把它算进签名的话，
+                    # 光标停在哪一行哪一行就会被判成未读。
+                    if sub.ControlTypeName not in ("ButtonControl", "MenuItemControl")
                 ))
             except Exception:
                 continue
@@ -724,6 +868,14 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
         node, name = item["node"], item["name"]
         reasons = []
 
+        # 当前选中的那个会话，字重和结构都跟别人不一样（Teams 给它加了高亮样式），
+        # 拿它跟其它行比会误判成未读。它正开着，本来也不可能有未读。
+        selected = False
+        try:
+            selected = bool(node.GetSelectionItemPattern().IsSelected)
+        except Exception:
+            selected = False
+
         if "text" in strategies:
             hit = _match_unread(name)
             if not hit:
@@ -734,17 +886,18 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
             if hit:
                 reasons.append(f"文字标记({hit})")
 
-        if "bold" in strategies and auto is not None and detect_bold(node, auto):
+        if "bold" in strategies and not selected and auto is not None and detect_bold(node, auto):
             reasons.append("标题加粗")
 
         if "dot" in strategies and detect_dot(node, pyautogui):
             reasons.append("右侧有蓝点")
 
-        if "structure" in strategies and name in outliers:
+        if "structure" in strategies and not selected and name in outliers:
             reasons.append("结构比其它会话多一个控件")
 
         if debug:
-            log(f"    [{'未读' if reasons else '已读'}] {name} — {'、'.join(reasons) or '无特征'}")
+            mark = "（当前选中）" if selected else ""
+            log(f"    [{'未读' if reasons else '已读'}] {name}{mark} — {'、'.join(reasons) or '无特征'}")
 
         if not reasons or name in seen:
             continue
@@ -936,13 +1089,25 @@ def append_report(path: str, entries: list[dict], note: str | None = None) -> No
 # 主流程
 # --------------------------------------------------------------------------- #
 def run_once(args, pyautogui, output_path: str) -> None:
-    wiggle_and_double_click(pyautogui, click=not args.no_click, pos=args.click_pos)
+    if not IS_WINDOWS:
+        wiggle_and_double_click(pyautogui, click=not args.no_click, pos=args.click_pos)
 
     if IS_WINDOWS:
         auto = import_uiautomation()
         if auto is None:
+            wiggle_and_double_click(pyautogui, click=not args.no_click, pos=args.click_pos)
             log("无法读取 Teams 未读消息，本轮跳过。")
             return
+
+        # 先定位窗口，把保活的双击挪到 Teams 之外，再激活、再扫描。
+        # 顺序很重要：点在会话列表上会切换选中项、弹出悬停菜单，
+        # 那样扫到的就不是 Teams 的原样了。
+        located = find_teams_window(auto, args.window_title)
+        click_pos = args.click_pos or safe_click_pos(pyautogui, rect_of(located) if located else None)
+        if click_pos is not None and args.click_pos is None:
+            log(f"光标在 Teams 窗口内，本次改到 {click_pos} 点击，避免干扰界面")
+        wiggle_and_double_click(pyautogui, click=not args.no_click, pos=click_pos)
+
         teams_win = activate_teams_windows(auto, args.window_title)
         if teams_win is None:
             return

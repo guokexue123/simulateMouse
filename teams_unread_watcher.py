@@ -310,10 +310,26 @@ def control_evidence(node, max_depth: int = 4) -> list[str]:
     return parts
 
 
+def warm_up_uia_tree(teams_win) -> int:
+    """先枚举一遍控件树，把 WebView2 的无障碍树"焐热"。
+
+    新版 Teams 是 WebView2 套壳，而 WebView2 有个已知问题：首次枚举 UIA 元素
+    只返回部分节点，第二次才完整。所以正式扫描前先空跑一遍。
+    """
+    count = sum(1 for _ in _iter_controls(teams_win))
+    time.sleep(0.5)
+    return count
+
+
 def find_unread_items(teams_win) -> list:
     """在 Teams 窗口里找出所有带未读标记的会话项。"""
     unread = []
     seen = set()
+    first_pass = warm_up_uia_tree(teams_win)
+    second_pass = sum(1 for _ in _iter_controls(teams_win))
+    if second_pass != first_pass:
+        log(f"控件树预热：首次枚举 {first_pass} 个节点，第二次 {second_pass} 个（WebView2 已知问题）")
+
     for node, _depth in _iter_controls(teams_win):
         try:
             ctrl_type = node.ControlTypeName

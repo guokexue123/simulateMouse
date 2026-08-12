@@ -1,0 +1,5 @@
+# 鼠标模拟（全平台）
+pyautogui>=0.9.54
+
+# Teams 未读消息读取（仅 Windows 需要）
+uiautomation>=2.0.18; sys_platform == "win32"

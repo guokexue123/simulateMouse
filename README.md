@@ -1,7 +1,21 @@
 # simulateMouse
 
-定时模拟鼠标点击保持机器唤醒，并抓取 Microsoft Teams 桌面客户端里的未读消息，
+定时模拟鼠标点击保持机器唤醒，并抓取 Microsoft Teams 的未读消息，
 把内容保存到临时 txt 文件。
+
+仓库里有两个脚本，取未读消息的方式完全不同：
+
+| | `teams_graph_unread.py`（推荐） | `teams_unread_watcher.py` |
+|---|---|---|
+| 取数方式 | 调 Microsoft Graph 官方接口 | 读 Teams 窗口的 UI 控件树 |
+| 要不要开着 Teams | 不用 | 要，且窗口不能最小化太久 |
+| 会不会被 Teams 改版搞挂 | 不会 | 会 |
+| 会不会把消息变成已读 | 不会 | 会（要点开会话） |
+| 平台 | 全平台 | 仅 Windows |
+| 前置条件 | 要有一个 Azure AD 应用 ID，公司租户可能要 IT 批 | 装个库就能跑 |
+
+新版 Teams 是 WebView2 套壳，无障碍树有已知缺陷（首次枚举只返回部分节点，
+未读蓝点可能压根不暴露成控件），所以 UI 那条路本身就不牢靠。**优先用 Graph 方案。**
 
 ## 安装
 
@@ -9,8 +23,38 @@
 pip install -r requirements.txt
 ```
 
+- `msal`、`requests`：Graph 方案用。
 - `pyautogui`：控制鼠标，全平台可用。
-- `uiautomation`：读取 Teams 界面上的未读会话，**仅 Windows**。
+- `uiautomation`：UI 方案读控件树用，**仅 Windows**。
+
+## 方案一：Graph 官方接口（推荐）
+
+```bash
+python teams_graph_unread.py --once          # 先跑一轮试通
+python teams_graph_unread.py                 # 每 60 秒轮询
+python teams_graph_unread.py --client-id <你自己注册的应用ID>
+python teams_graph_unread.py --no-keep-awake # 不做鼠标保活
+```
+
+首次运行会打印一个网址和一段验证码，在浏览器里输入完成登录（设备代码登录）。
+登录状态缓存在 `~/.teams_graph_token.json`，之后不用重复登。
+**这个文件里有刷新令牌，别提交到仓库、别发给别人。**
+
+判断未读的依据是官方文档给的办法：每个会话的 `viewpoint.lastMessageReadDateTime`
+记录你最后读到哪一刻，跟 `lastMessagePreview.createdDateTime` 一比就知道有没有未读；
+再按时间倒序拉该会话的消息，取比"最后已读时间"更新的那些。
+
+### 关于 client id
+
+默认用的是 Microsoft Graph 命令行工具的公共 ID
+（`14d82eec-204b-4c2f-b7e8-296a70dab67e`，Graph PowerShell 用的就是它）。
+它是微软第一方应用，多数租户里已存在，适合先拿来试通流程。
+
+如果公司租户禁用了它，或者提示需要管理员同意，就自己在 Azure AD 里注册一个
+**公共客户端 / 本机应用**，勾上"允许公共客户端流"，申请委托权限 `Chat.Read`，
+然后把应用 ID 用 `--client-id` 传进来。公司租户通常需要 IT 管理员点同意。
+
+## 方案二：读 UI 控件树（备选）
 
 ## 使用
 

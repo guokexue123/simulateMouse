@@ -3,3 +3,7 @@ pyautogui>=0.9.54
 
 # Teams 未读消息读取（仅 Windows 需要）
 uiautomation>=2.0.18; sys_platform == "win32"
+
+# 官方 Graph API 方案（teams_graph_unread.py）
+msal>=1.28.0
+requests>=2.31.0

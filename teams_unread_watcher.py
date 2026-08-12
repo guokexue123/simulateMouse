@@ -369,15 +369,18 @@ def _iter_controls(root, max_depth: int = DEFAULT_MAX_DEPTH,
             queue.append((child, depth + 1))
 
 
-def control_evidence(node, max_depth: int = 4) -> list[str]:
-    """收集会话项自身及其子控件上所有可读的标识文本。
+def control_evidence(node, max_depth: int = 4, include_ids: bool = False) -> list[str]:
+    """收集会话项自身及其子控件上可读的标识文本。
 
-    未读蓝点没有文字，但承载它的控件往往在 Name / AutomationId / ClassName
-    或无障碍描述里留下线索，所以这几处都要收。
+    默认只取 Name 和无障碍描述。AutomationId / ClassName 里可能常驻着
+    "unread-badge"之类的标识——不管当前有没有未读它都在，拿来判断会一直误报。
+    实测这个 Teams 版本把未读写在 Name 里（"未读消息 群组聊天 XXX"），够用了。
+    导出诊断文件时才需要 include_ids=True 看全部属性。
     """
+    attrs = ("Name", "AutomationId", "ClassName") if include_ids else ("Name",)
     parts: list[str] = []
     for sub, _depth in _iter_controls(node, max_depth=max_depth, max_nodes=200):
-        for attr in ("Name", "AutomationId", "ClassName"):
+        for attr in attrs:
             try:
                 value = getattr(sub, attr, "") or ""
             except Exception:
@@ -750,7 +753,7 @@ def detect_dot(node, pyautogui) -> bool:
 
 
 def find_unread_items(teams_win, auto=None, pyautogui=None,
-                      strategies: tuple[str, ...] = ("text", "bold", "structure"),
+                      strategies: tuple[str, ...] = ("text",),
                       debug: bool = False) -> list:
     """在 Teams 窗口里找出所有带未读标记的会话项。
 
@@ -864,6 +867,7 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
 
     unread = []
     seen = set()
+    fired: dict[str, int] = {}                      # 每种判断各命中了多少，用来定位误报来源
     for item in chat_items:
         node, name = item["node"], item["name"]
         reasons = []
@@ -885,15 +889,19 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
                         break
             if hit:
                 reasons.append(f"文字标记({hit})")
+                fired["text"] = fired.get("text", 0) + 1
 
         if "bold" in strategies and not selected and auto is not None and detect_bold(node, auto):
             reasons.append("标题加粗")
+            fired["bold"] = fired.get("bold", 0) + 1
 
         if "dot" in strategies and detect_dot(node, pyautogui):
             reasons.append("右侧有蓝点")
+            fired["dot"] = fired.get("dot", 0) + 1
 
         if "structure" in strategies and not selected and name in outliers:
             reasons.append("结构比其它会话多一个控件")
+            fired["structure"] = fired.get("structure", 0) + 1
 
         if debug:
             mark = "（当前选中）" if selected else ""
@@ -903,6 +911,11 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
             continue
         seen.add(name)
         unread.append((node, item["display"], "、".join(reasons)))
+
+    if fired:
+        # 误报时看这行就知道该关掉哪一种判断。
+        detail = "、".join(f"{key} 命中 {count} 个" for key, count in sorted(fired.items()))
+        log(f"判定依据统计：{detail}")
     return unread
 
 
@@ -966,9 +979,47 @@ def read_messages_of_current_chat(teams_win, limit: int = 30) -> list[str]:
     return messages[-limit:]
 
 
+def open_chat(node, pyautogui=None) -> str:
+    """打开一个会话，尽量不动鼠标。
+
+    node.Click() 会把光标物理拖到目标上，一轮下来鼠标满屏乱跑，还会把光标
+    留在 Teams 里影响下一轮。UI Automation 本身提供了不碰鼠标的调用方式，
+    优先用它们，都不支持时才退回真点击，并且点完把光标放回原处。
+    """
+    try:
+        node.GetSelectionItemPattern().Select()
+        return "Select"
+    except Exception:
+        pass
+    try:
+        node.GetInvokePattern().Invoke()
+        return "Invoke"
+    except Exception:
+        pass
+    try:
+        node.GetLegacyIAccessiblePattern().DoDefaultAction()
+        return "DoDefaultAction"
+    except Exception:
+        pass
+
+    origin = None
+    if pyautogui is not None:
+        try:
+            origin = pyautogui.position()
+        except Exception:
+            origin = None
+    node.Click(simulateMove=False, waitTime=0.5)
+    if origin is not None:                          # 把光标放回去，别留在 Teams 里
+        try:
+            pyautogui.moveTo(origin[0], origin[1], duration=0)
+        except Exception:
+            pass
+    return "物理点击"
+
+
 def collect_unread_windows(teams_win, open_each: bool = True, auto=None, pyautogui=None,
-                           strategies: tuple[str, ...] = ("text", "bold", "structure"),
-                           debug: bool = False) -> list[dict]:
+                           strategies: tuple[str, ...] = ("text",),
+                           debug: bool = False, max_open: int = 10) -> list[dict]:
     """返回 [{'chat': 会话标题, 'badge': 未读标记, 'messages': [...]}, ...]"""
     results = []
     unread_items = find_unread_items(teams_win, auto=auto, pyautogui=pyautogui,
@@ -978,13 +1029,20 @@ def collect_unread_windows(teams_win, open_each: bool = True, auto=None, pyautog
         return results
 
     log(f"检测到 {len(unread_items)} 个未读会话。")
-    for node, name, badge in unread_items:
+    if open_each and len(unread_items) > max_open:
+        # 一次点开几十个会话既慢又容易把界面搅乱，多半也说明判断出了问题。
+        log(f"未读会话超过 {max_open} 个，只读前 {max_open} 个的正文，其余只记会话名。"
+            f"（数量异常多的话，多半是误判，加 --debug-detect 看看依据）")
+
+    for index, (node, name, badge) in enumerate(unread_items):
         entry = {"chat": name, "badge": badge, "messages": []}
-        if open_each:
+        if open_each and index < max_open:
             try:
-                node.Click(simulateMove=False, waitTime=0.8)
+                how = open_chat(node, pyautogui)
                 time.sleep(0.8)                       # 等消息区域渲染完
                 entry["messages"] = read_messages_of_current_chat(teams_win)
+                if debug:
+                    log(f"    打开「{name}」用的是 {how}")
             except Exception as exc:
                 log(f"打开会话「{name}」失败：{exc}")
         results.append(entry)
@@ -1117,7 +1175,7 @@ def run_once(args, pyautogui, output_path: str) -> None:
             dump_chat_items(teams_win, args.dump_chats)
         entries = collect_unread_windows(
             teams_win, open_each=not args.no_open, auto=auto, pyautogui=pyautogui,
-            strategies=args.detect, debug=args.debug_detect,
+            strategies=args.detect, debug=args.debug_detect, max_open=args.max_open,
         )
         if entries:
             append_report(output_path, entries)
@@ -1168,10 +1226,11 @@ def main() -> int:
                         help="把 Teams 整棵控件树导出到文件")
     parser.add_argument("--dump-chats", default=None, metavar="PATH",
                         help="只导出会话列表项及其子控件属性，排查未读检测优先用这个")
-    parser.add_argument("--detect", type=parse_strategies,
-                        default=("text", "bold", "structure"),
+    parser.add_argument("--detect", type=parse_strategies, default=("text",),
                         help="未读判断方式，逗号分隔：text,bold,dot,structure"
-                             "（默认 text,bold,structure；dot 误报多，需要时再手动加上）")
+                             "（默认只用 text，实测最准；其余三种误报多，需要时再手动加）")
+    parser.add_argument("--max-open", type=int, default=10,
+                        help="每轮最多打开多少个未读会话读正文，默认 10")
     parser.add_argument("--debug-detect", action="store_true",
                         help="逐个打印每个会话项的判断结果和依据")
     args = parser.parse_args()

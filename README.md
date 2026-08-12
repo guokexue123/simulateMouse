@@ -94,8 +94,13 @@ python teams_unread_watcher.py --window-title "Microsoft Teams"   # 强制指定
    | `structure` | 结构上比多数会话项多挂一个控件（按数量比，不只比类型） | 蓝点是个控件但没有文字标识 |
    | `dot` | 会话项右侧截图找蓝紫色圆点 | **默认不启用**，见下 |
 
-   默认启用 `text,bold,structure`。用 `--detect` 改，比如 `--detect text`。
-   加 `--debug-detect` 会逐个打印每个会话的判断结果和依据。
+   **默认只启用 `text`**——实测这个 Teams 版本把未读写进控件名了，一条就够，
+   而另外三条在真实列表上都会误报。用 `--detect text,bold` 可以加回来。
+   每轮都会打印一行 `判定依据统计：text 命中 N 个`，误报时看这行就知道该关哪条。
+   加 `--debug-detect` 会逐个打印每个会话的判断结果。
+
+   `text` 只匹配控件的 **Name**，不匹配 AutomationId / ClassName——后者可能常驻
+   `unread-badge` 之类的标识，不管有没有未读它都在，拿来判断会一直误报。
 
    `dot` 默认关掉了：它靠截图认颜色，实测会把选中态背景、彩色图标、蓝色文字
    都当成未读圆点（一次 10 个会话误报了 9 个）。现在的判断收紧到"小而圆的实心斑"
@@ -152,6 +157,11 @@ python teams_unread_watcher.py --window-title "Microsoft Teams"   # 强制指定
   macOS / Linux 上脚本只会做鼠标保活和唤醒 Teams，并在 txt 里写一条说明。
 - **点开会话会把消息标记为已读**，这是 Teams 自身的行为。不想改变已读状态就用
   `--no-open`，只记录会话名和未读条数。
+- **打开会话不会动鼠标**：优先用 UI Automation 的 `Select` / `Invoke` /
+  `DoDefaultAction` 调用，只有这些都不支持时才退回真点击，并且点完把光标放回原处。
+  否则一轮下来鼠标会被拖着满屏乱点，还会把光标留在 Teams 里干扰下一轮。
+- **`--max-open`** 限制每轮最多打开多少个会话读正文（默认 10）。检测出几十个未读
+  多半是误判，这个上限能避免它连点几十下。
 - Teams 各版本（新版 Teams / classic）控件树结构不同，`UNREAD_PATTERNS` 和
   `read_messages_of_current_chat()` 里的容器判断可能需要按实际界面微调。
   可以用 `uiautomation` 自带的 `automation.py -t 3` 导出控件树来对照。

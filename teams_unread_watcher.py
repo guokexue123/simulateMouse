@@ -265,17 +265,60 @@ def _match_unread(name: str) -> str | None:
     return None
 
 
-def _iter_controls(root, max_depth: int = 14, max_nodes: int = 6000):
+# WebView2 的控件树又深又宽，上限设小了会在扫到会话列表之前就把预算用光。
+DEFAULT_MAX_DEPTH = 40
+DEFAULT_MAX_NODES = 60000
+
+
+class TraversalStats:
+    """记录一次遍历的规模，用来判断"什么都没找到"是不是因为遍历被截断了。"""
+
+    def __init__(self):
+        self.visited = 0
+        self.max_depth_seen = 0
+        self.truncated_by_nodes = False
+        self.truncated_by_depth = False
+        self.type_counts: dict[str, int] = {}
+
+    def summary(self) -> str:
+        top = sorted(self.type_counts.items(), key=lambda kv: -kv[1])[:6]
+        types = "、".join(f"{name}×{count}" for name, count in top) or "无"
+        flags = []
+        if self.truncated_by_nodes:
+            flags.append("节点数超限")
+        if self.truncated_by_depth:
+            flags.append("深度超限")
+        limit = f"，已截断（{'、'.join(flags)}）" if flags else ""
+        return (f"遍历 {self.visited} 个节点，最深 {self.max_depth_seen} 层{limit}；"
+                f"控件类型：{types}")
+
+
+def _iter_controls(root, max_depth: int = DEFAULT_MAX_DEPTH,
+                   max_nodes: int = DEFAULT_MAX_NODES, stats: TraversalStats | None = None):
     """广度优先遍历控件树，带深度和节点数上限，避免在大树上卡死。"""
     import collections
 
     queue = collections.deque([(root, 0)])
     visited = 0
-    while queue and visited < max_nodes:
+    while queue:
+        if visited >= max_nodes:
+            if stats is not None:
+                stats.truncated_by_nodes = True
+            break
         node, depth = queue.popleft()
         visited += 1
+        if stats is not None:
+            stats.visited = visited
+            stats.max_depth_seen = max(stats.max_depth_seen, depth)
+            try:
+                ctype = node.ControlTypeName
+            except Exception:
+                ctype = "?"
+            stats.type_counts[ctype] = stats.type_counts.get(ctype, 0) + 1
         yield node, depth
         if depth >= max_depth:
+            if stats is not None:
+                stats.truncated_by_depth = True
             continue
         try:
             children = node.GetChildren()
@@ -319,6 +362,66 @@ def warm_up_uia_tree(teams_win) -> int:
     count = sum(1 for _ in _iter_controls(teams_win))
     time.sleep(0.5)
     return count
+
+
+# 会话项可能是这些类型里的任何一种，取决于 Teams 版本怎么搭的界面。
+CHAT_ITEM_TYPES = (
+    "ListItemControl", "TreeItemControl", "DataItemControl",
+    "GroupControl", "ButtonControl", "HyperlinkControl",
+)
+
+
+def derive_name(node, max_depth: int = 3) -> str:
+    """取控件的显示名：自己没有名字就把子控件的文字拼起来。
+
+    WebView2 里会话项自己往往是个无名容器，名字挂在里面的 TextControl 上，
+    只看自身 Name 会把整个列表都漏掉。
+    """
+    try:
+        own = (node.Name or "").strip()
+    except Exception:
+        own = ""
+    if own:
+        return own
+
+    parts = []
+    for sub, _depth in _iter_controls(node, max_depth=max_depth, max_nodes=40):
+        if sub is node:
+            continue
+        try:
+            if sub.ControlTypeName != "TextControl":
+                continue
+            text = (sub.Name or "").strip()
+        except Exception:
+            continue
+        if text and text not in parts:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+def looks_like_chat_row(rect: tuple[int, int, int, int] | None,
+                        window_rect: tuple[int, int, int, int] | None) -> bool:
+    """按几何形状判断一个控件像不像会话列表里的一行。
+
+    会话行的特征很稳定：位于窗口左侧，宽度远大于高度的横条。
+    控件类型和名称都指望不上时，靠这个兜底。
+    """
+    if rect is None or window_rect is None:
+        return False
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    win_left, win_top, win_right, win_bottom = window_rect
+    win_width = win_right - win_left
+
+    if win_width <= 0:
+        return False
+    if left > win_left + win_width * 0.45:          # 必须在左侧面板里
+        return False
+    if not (120 <= width <= win_width * 0.5):       # 太窄是图标，太宽是整个面板
+        return False
+    if not (24 <= height <= 110):                   # 一行的高度范围
+        return False
+    return True
 
 
 def rect_of(node) -> tuple[int, int, int, int] | None:
@@ -405,12 +508,20 @@ def signature_outliers(signatures: list[tuple[str, tuple]]) -> set[str]:
     if baseline_count < len(signatures) / 2:        # 没有占多数的"常态"，放弃
         return set()
 
-    baseline_set = set(baseline)
+    # 要按数量比，不能只比类型种类：未读蓝点多半也是个 ImageControl，
+    # 而每行本来就有个头像 ImageControl，只看"有没有新类型"会漏掉它。
+    baseline_counts: dict[str, int] = {}
+    for ctype in baseline:
+        baseline_counts[ctype] = baseline_counts.get(ctype, 0) + 1
+
     outliers = set()
     for name, sig in signatures:
         if sig == baseline:
             continue
-        if set(sig) - baseline_set:                 # 比常态多出了某类控件
+        item_counts: dict[str, int] = {}
+        for ctype in sig:
+            item_counts[ctype] = item_counts.get(ctype, 0) + 1
+        if any(count > baseline_counts.get(ctype, 0) for ctype, count in item_counts.items()):
             outliers.add(name)
     return outliers
 
@@ -418,10 +529,10 @@ def signature_outliers(signatures: list[tuple[str, tuple]]) -> set[str]:
 def detect_bold(node, auto) -> bool:
     """判断会话项的标题是不是加粗的——Teams 用加粗表示未读。"""
     UIA_FONT_WEIGHT = 30083                         # UIA_FontWeightAttributeId
+    # 不按控件类型筛：字体属性可能挂在文字控件上，也可能挂在承载它的容器上，
+    # 没有 TextPattern 的控件调用会抛异常，跳过即可。
     for sub, _depth in _iter_controls(node, max_depth=4, max_nodes=60):
         try:
-            if sub.ControlTypeName not in ("TextControl", "ListItemControl"):
-                continue
             weight = sub.GetTextPattern().DocumentRange.GetAttributeValue(UIA_FONT_WEIGHT)
         except Exception:
             continue
@@ -477,30 +588,50 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
     if second_pass != first_pass:
         log(f"控件树预热：首次枚举 {first_pass} 个节点，第二次 {second_pass} 个（WebView2 已知问题）")
 
-    # 收集所有候选会话项，连同定位信息，供后面挑出真正的会话列表。
-    candidates = []
-    for node, _depth in _iter_controls(teams_win):
-        try:
-            if node.ControlTypeName not in ("ListItemControl", "TreeItemControl"):
-                continue
-            name = (node.Name or "").strip()
-            if not name:
-                continue
-            parent = node.GetParentControl()
-            parent_key = parent.GetRuntimeId() if parent else None
-        except Exception:
-            continue
-        candidates.append({
-            "node": node,
-            "name": name,
-            "rect": rect_of(node),
-            "parent": tuple(parent_key) if parent_key else None,
-        })
+    window_rect = rect_of(teams_win)
+    stats = TraversalStats()
+    nodes = list(_iter_controls(teams_win, stats=stats))
 
-    chat_items = pick_chat_list(candidates, rect_of(teams_win))
+    def collect(accept) -> list[dict]:
+        found = []
+        for node, _depth in nodes:
+            try:
+                if not accept(node):
+                    continue
+                name = derive_name(node)
+                if not name:
+                    continue
+                parent = node.GetParentControl()
+                parent_key = parent.GetRuntimeId() if parent else None
+            except Exception:
+                continue
+            found.append({
+                "node": node,
+                "name": name,
+                "rect": rect_of(node),
+                "parent": tuple(parent_key) if parent_key else None,
+            })
+        return found
+
+    # 第一轮：按控件类型找。
+    candidates = collect(lambda n: n.ControlTypeName in CHAT_ITEM_TYPES)
+    how = "按控件类型"
+
+    # 第二轮：类型这条路走不通时，改按几何形状找左侧那一竖排横条。
+    if not candidates:
+        candidates = collect(lambda n: looks_like_chat_row(rect_of(n), window_rect))
+        how = "按几何形状"
+
+    chat_items = pick_chat_list(candidates, window_rect)
     if not chat_items:
         chat_items = candidates                     # 挑不出来就退回全量，宁可多报
-    log(f"会话列表：{len(chat_items)} 项（候选 {len(candidates)} 项）")
+    log(f"会话列表：{len(chat_items)} 项（候选 {len(candidates)} 项，{how}）")
+
+    if not chat_items:
+        # 一个都没找到，把树的规模打出来——多半是被截断了，或者根本没暴露出来。
+        log("没找到任何会话项。控件树情况：")
+        log(f"    {stats.summary()}")
+        log("    请用 --dump-tree 导出完整控件树，看看会话列表有没有出现在里面。")
 
     # structure 是横向比较，得先把所有项的签名算出来。
     outliers: set[str] = set()

@@ -82,8 +82,19 @@ python teams_unread_watcher.py --window-title "Microsoft Teams"   # 强制指定
    标题匹配（必须严格含 "Microsoft Teams"）。找不到窗口会列出所有顶层窗口的
    标题和进程名，方便用 `--window-title` 手动指定。macOS 用 `osascript` 激活；
    macOS 用 `osascript` 激活；Linux 用 `wmctrl -a Teams`。
-3. **找未读会话**：遍历 Teams 窗口的 UI Automation 控件树，按控件名匹配
-   “3 条未读”“2 unread”“new message”等中英文标记。
+3. **找未读会话**：先挑出左侧会话列表（按"同一父控件下多个项、且在窗口左半边"
+   识别，避免把工具栏、下拉菜单里的列表项也算进来），再用四种方式判断未读，
+   **任意一种命中就算未读**：
+
+   | 方式 | 依据 | 适用情况 |
+   |---|---|---|
+   | `text` | 控件名 / AutomationId 里有"未读""unread"等字样 | 老版本 Teams |
+   | `bold` | 标题字体加粗（UIA 字体粗细属性，≥600 算粗体） | 无障碍树暴露了字体属性时 |
+   | `dot` | 会话项右侧 25% 区域截图找蓝紫色圆点 | 蓝点是 CSS 画的、控件树里没有时 |
+   | `structure` | 结构上比多数会话项多挂一个控件 | 蓝点是个控件但没有任何文字标识 |
+
+   用 `--detect` 选择，比如 `--detect dot,structure`；默认四种全开。
+   加 `--debug-detect` 会逐个打印每个会话的判断结果和依据。
 4. **读消息正文**：依次点开每个未读会话，从消息区域读取控件名
    （Teams 的无障碍描述里已经带了“谁 说了 什么 时间”）。
 5. **写文件**：追加写入临时 txt，默认路径类似
@@ -113,8 +124,13 @@ python teams_unread_watcher.py --window-title "Microsoft Teams"   # 强制指定
 - **fail-safe**：pyautogui 在光标位于屏幕四角时会抛异常紧急停止。脚本会自动把
   光标从角落挪进来几个像素再抖动，避免误触发；万一还是触发了，只跳过这一轮的
   鼠标保活，不影响同一轮的 Teams 抓取。
-- **未读检测不生效时**：用 `--dump-tree d:/tree.txt` 导出控件树，在里面搜一下未读
-  会话那一行实际的控件名长什么样，再对照着改 `UNREAD_PATTERNS`。
+- **`dot` 方式要求 Teams 真的可见**：它是截屏看像素，如果 Teams 被别的窗口挡住、
+  或者最小化了，截到的就是别的东西。跑的时候别把窗口盖住。
+- **`structure` 方式需要至少 3 个会话**做横向比较，且要有一个占多数的"常态"结构，
+  否则它会放弃判断（返回空）而不是乱猜。
+- **未读检测不生效时**：先加 `--debug-detect` 看每个会话被判成什么、依据是什么；
+  还是不行就用 `--dump-chats d:/chats.txt` 导出会话列表，对比未读和已读那两项的
+  差异在哪。
 - **读取未读消息只支持 Windows**，因为依赖 Windows UI Automation。
   macOS / Linux 上脚本只会做鼠标保活和唤醒 Teams，并在 txt 里写一条说明。
 - **点开会话会把消息标记为已读**，这是 Teams 自身的行为。不想改变已读状态就用

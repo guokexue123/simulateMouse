@@ -321,39 +321,234 @@ def warm_up_uia_tree(teams_win) -> int:
     return count
 
 
-def find_unread_items(teams_win) -> list:
-    """在 Teams 窗口里找出所有带未读标记的会话项。"""
-    unread = []
-    seen = set()
+def rect_of(node) -> tuple[int, int, int, int] | None:
+    """取控件的屏幕坐标 (left, top, right, bottom)，取不到返回 None。"""
+    try:
+        rect = node.BoundingRectangle
+        if rect is None:
+            return None
+        box = (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        return None
+    if box[2] <= box[0] or box[3] <= box[1]:        # 宽或高为 0 的控件是隐藏的
+        return None
+    return box
+
+
+def pick_chat_list(items: list[dict], window_rect: tuple[int, int, int, int] | None) -> list[dict]:
+    """从所有列表项里挑出左侧会话列表那一组。
+
+    Teams 窗口里 ListItem 到处都是（工具栏、下拉菜单等），只看控件类型会混进
+    一堆无关项。会话列表的特征是：同一个父控件下挂着多个项，且都在窗口左半边。
+
+    items 每项形如 {'name':…, 'rect':…, 'parent':…}，纯数据，方便离线测试。
+    """
+    groups: dict[object, list[dict]] = {}
+    for item in items:
+        groups.setdefault(item["parent"], []).append(item)
+
+    best: list[dict] = []
+    best_score = 0
+    for members in groups.values():
+        if len(members) < 2:                        # 单个项构不成列表
+            continue
+        score = len(members)
+        if window_rect is not None:
+            win_left, _, win_right, _ = window_rect
+            half = win_left + (win_right - win_left) / 2
+            in_left = sum(
+                1 for m in members
+                if m["rect"] is not None and m["rect"][0] < half
+            )
+            if in_left < len(members) / 2:          # 多数不在左半边，不是会话列表
+                continue
+            score += in_left
+        if score > best_score:
+            best, best_score = members, score
+    return best
+
+
+def is_accent_pixel(r: int, g: int, b: int) -> bool:
+    """判断一个像素是不是 Teams 的蓝紫色强调色（未读圆点的颜色）。
+
+    新版 Teams 主题色约 #5B5FC7，深色主题下更亮一些。共同特征是蓝色分量
+    明显高于红绿，且颜色够饱和——灰色文字和白色背景都不满足。
+    """
+    if b < 90:                                      # 太暗，不是那个圆点
+        return False
+    if b - r < 40 or b - g < 40:                    # 蓝色分量必须明显占优
+        return False
+    return max(r, g, b) - min(r, g, b) >= 50        # 饱和度足够
+
+
+def count_accent_pixels(pixels: list[tuple[int, int, int]]) -> int:
+    """统计一批像素里有多少个是强调色，供圆点检测使用。"""
+    return sum(1 for px in pixels if is_accent_pixel(*px[:3]))
+
+
+def signature_outliers(signatures: list[tuple[str, tuple]]) -> set[str]:
+    """结构离群检测：未读项比已读项多挂一个控件（那个蓝点）。
+
+    把每个会话项的子控件类型组合当作"结构签名"，取出现次数最多的签名当作
+    "已读"的样子，签名比它多出东西的就是可疑的未读项。
+
+    这条不依赖任何文字，也不依赖颜色，纯靠"未读项和已读项长得不一样"。
+    """
+    if len(signatures) < 3:                         # 样本太少，结论不可信
+        return set()
+
+    counts: dict[tuple, int] = {}
+    for _name, sig in signatures:
+        counts[sig] = counts.get(sig, 0) + 1
+
+    baseline, baseline_count = max(counts.items(), key=lambda kv: kv[1])
+    if baseline_count < len(signatures) / 2:        # 没有占多数的"常态"，放弃
+        return set()
+
+    baseline_set = set(baseline)
+    outliers = set()
+    for name, sig in signatures:
+        if sig == baseline:
+            continue
+        if set(sig) - baseline_set:                 # 比常态多出了某类控件
+            outliers.add(name)
+    return outliers
+
+
+def detect_bold(node, auto) -> bool:
+    """判断会话项的标题是不是加粗的——Teams 用加粗表示未读。"""
+    UIA_FONT_WEIGHT = 30083                         # UIA_FontWeightAttributeId
+    for sub, _depth in _iter_controls(node, max_depth=4, max_nodes=60):
+        try:
+            if sub.ControlTypeName not in ("TextControl", "ListItemControl"):
+                continue
+            weight = sub.GetTextPattern().DocumentRange.GetAttributeValue(UIA_FONT_WEIGHT)
+        except Exception:
+            continue
+        try:
+            if int(weight) >= 600:                  # 400 是正常，700 是粗体
+                return True
+        except (TypeError, ValueError):
+            continue                                # 返回"混合值"时无法比较，跳过
+    return False
+
+
+def detect_dot(node, pyautogui) -> bool:
+    """在会话项右侧区域找蓝色圆点。
+
+    不读控件树，直接截这一行的图看像素——蓝点如果是 CSS 画的、
+    UIA 里根本不存在，这是唯一还能看见它的办法。
+    """
+    if pyautogui is None:
+        return False
+    box = rect_of(node)
+    if box is None:
+        return False
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    if width < 40 or height < 10:
+        return False
+
+    # 只看右边 25%，头像和文字都在左边，避免误判。
+    strip_left = left + int(width * 0.75)
+    try:
+        shot = pyautogui.screenshot(region=(strip_left, top, right - strip_left, height))
+        pixels = list(shot.convert("RGB").getdata())
+    except Exception:
+        return False
+    return count_accent_pixels(pixels) >= 12        # 圆点大概十几到几十个像素
+
+
+def find_unread_items(teams_win, auto=None, pyautogui=None,
+                      strategies: tuple[str, ...] = ("text", "bold", "dot", "structure"),
+                      debug: bool = False) -> list:
+    """在 Teams 窗口里找出所有带未读标记的会话项。
+
+    四种判断方式，任意一种命中就算未读：
+      text      —— 控件名 / AutomationId 里带"未读""unread"等字样
+      bold      —— 标题字体加粗（UIA 字体粗细属性）
+      dot       —— 会话项右侧有蓝紫色圆点（截图看像素）
+      structure —— 结构上比多数会话项多挂了一个控件
+
+    新版 Teams 到底用哪种方式暴露未读状态，取决于版本，所以全试一遍。
+    """
     first_pass = warm_up_uia_tree(teams_win)
     second_pass = sum(1 for _ in _iter_controls(teams_win))
     if second_pass != first_pass:
         log(f"控件树预热：首次枚举 {first_pass} 个节点，第二次 {second_pass} 个（WebView2 已知问题）")
 
+    # 收集所有候选会话项，连同定位信息，供后面挑出真正的会话列表。
+    candidates = []
     for node, _depth in _iter_controls(teams_win):
         try:
-            ctrl_type = node.ControlTypeName
+            if node.ControlTypeName not in ("ListItemControl", "TreeItemControl"):
+                continue
             name = (node.Name or "").strip()
+            if not name:
+                continue
+            parent = node.GetParentControl()
+            parent_key = parent.GetRuntimeId() if parent else None
         except Exception:
             continue
-        if ctrl_type not in ("ListItemControl", "TreeItemControl", "ButtonControl"):
-            continue
-        if not name:
-            continue
+        candidates.append({
+            "node": node,
+            "name": name,
+            "rect": rect_of(node),
+            "parent": tuple(parent_key) if parent_key else None,
+        })
 
-        # 先看会话项自己的名字，再看子控件——蓝点的标记只会出现在后者。
-        hit = _match_unread(name)
-        if not hit:
-            for evidence in control_evidence(node):
-                hit = _match_unread(evidence)
-                if hit:
-                    break
-        if not hit:
-            continue
-        if name in seen:
+    chat_items = pick_chat_list(candidates, rect_of(teams_win))
+    if not chat_items:
+        chat_items = candidates                     # 挑不出来就退回全量，宁可多报
+    log(f"会话列表：{len(chat_items)} 项（候选 {len(candidates)} 项）")
+
+    # structure 是横向比较，得先把所有项的签名算出来。
+    outliers: set[str] = set()
+    if "structure" in strategies:
+        signatures = []
+        for item in chat_items:
+            try:
+                sig = tuple(sorted(
+                    sub.ControlTypeName
+                    for sub, _d in _iter_controls(item["node"], max_depth=2, max_nodes=40)
+                ))
+            except Exception:
+                continue
+            signatures.append((item["name"], sig))
+        outliers = signature_outliers(signatures)
+
+    unread = []
+    seen = set()
+    for item in chat_items:
+        node, name = item["node"], item["name"]
+        reasons = []
+
+        if "text" in strategies:
+            hit = _match_unread(name)
+            if not hit:
+                for evidence in control_evidence(node):
+                    hit = _match_unread(evidence)
+                    if hit:
+                        break
+            if hit:
+                reasons.append(f"文字标记({hit})")
+
+        if "bold" in strategies and auto is not None and detect_bold(node, auto):
+            reasons.append("标题加粗")
+
+        if "dot" in strategies and detect_dot(node, pyautogui):
+            reasons.append("右侧有蓝点")
+
+        if "structure" in strategies and name in outliers:
+            reasons.append("结构比其它会话多一个控件")
+
+        if debug:
+            log(f"    [{'未读' if reasons else '已读'}] {name} — {'、'.join(reasons) or '无特征'}")
+
+        if not reasons or name in seen:
             continue
         seen.add(name)
-        unread.append((node, name, hit))
+        unread.append((node, name, "、".join(reasons)))
     return unread
 
 
@@ -410,10 +605,13 @@ def read_messages_of_current_chat(teams_win, limit: int = 30) -> list[str]:
     return messages[-limit:]
 
 
-def collect_unread_windows(teams_win, open_each: bool = True) -> list[dict]:
+def collect_unread_windows(teams_win, open_each: bool = True, auto=None, pyautogui=None,
+                           strategies: tuple[str, ...] = ("text", "bold", "dot", "structure"),
+                           debug: bool = False) -> list[dict]:
     """返回 [{'chat': 会话标题, 'badge': 未读标记, 'messages': [...]}, ...]"""
     results = []
-    unread_items = find_unread_items(teams_win)
+    unread_items = find_unread_items(teams_win, auto=auto, pyautogui=pyautogui,
+                                     strategies=strategies, debug=debug)
     if not unread_items:
         log("没有检测到未读会话。")
         return results
@@ -544,7 +742,10 @@ def run_once(args, pyautogui, output_path: str) -> None:
             dump_control_tree(teams_win, args.dump_tree)
         if args.dump_chats:
             dump_chat_items(teams_win, args.dump_chats)
-        entries = collect_unread_windows(teams_win, open_each=not args.no_open)
+        entries = collect_unread_windows(
+            teams_win, open_each=not args.no_open, auto=auto, pyautogui=pyautogui,
+            strategies=args.detect, debug=args.debug_detect,
+        )
         if entries:
             append_report(output_path, entries)
     else:
@@ -557,6 +758,17 @@ def run_once(args, pyautogui, output_path: str) -> None:
             output_path, [],
             note=f"{platform.system()} 上只执行了鼠标保活与唤醒 Teams，未读消息读取仅支持 Windows。",
         )
+
+
+def parse_strategies(value: str) -> tuple[str, ...]:
+    known = ("text", "bold", "dot", "structure")
+    picked = tuple(s.strip().lower() for s in value.split(",") if s.strip())
+    bad = [s for s in picked if s not in known]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"未知的判断方式 {bad}，可选：{'、'.join(known)}"
+        )
+    return picked or known
 
 
 def parse_pos(value: str | None) -> tuple[int, int] | None:
@@ -583,6 +795,11 @@ def main() -> int:
                         help="把 Teams 整棵控件树导出到文件")
     parser.add_argument("--dump-chats", default=None, metavar="PATH",
                         help="只导出会话列表项及其子控件属性，排查未读检测优先用这个")
+    parser.add_argument("--detect", type=parse_strategies,
+                        default=("text", "bold", "dot", "structure"),
+                        help="未读判断方式，逗号分隔：text,bold,dot,structure（默认全开）")
+    parser.add_argument("--debug-detect", action="store_true",
+                        help="逐个打印每个会话项的判断结果和依据")
     args = parser.parse_args()
 
     output_path = make_output_path(args.output)

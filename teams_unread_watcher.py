@@ -43,12 +43,17 @@ IS_WINDOWS = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 
 # 会话列表里判断“未读”的关键词 / 模式，兼容中英文界面。
+# 新版 Teams 的未读是“加粗 + 右侧蓝点”，标题文字里不带“未读”二字，
+# 标记通常挂在会话项内部的子控件上（名称或 AutomationId 里带 unread / 新活动）。
+# 所以这些模式要拿会话项**及其子控件**的文本去匹配，不能只看会话项自己的名字。
 UNREAD_PATTERNS = [
-    re.compile(r"(\d+)\s*条?\s*(?:未读|新消息)"),        # “3 条未读”“2条新消息”
+    re.compile(r"(\d+)\s*条?\s*(?:未读|新消息|新通知)"),   # “3 条未读”“2条新消息”
     re.compile(r"未读", re.IGNORECASE),
+    re.compile(r"新活动"),
+    re.compile(r"新消息"),
     re.compile(r"(\d+)\s+unread", re.IGNORECASE),        # “3 unread”
     re.compile(r"\bunread\b", re.IGNORECASE),
-    re.compile(r"\bnew messages?\b", re.IGNORECASE),
+    re.compile(r"\bnew (?:messages?|activity|notifications?)\b", re.IGNORECASE),
 ]
 
 # Teams 客户端的进程名：新版 Teams 是 ms-teams.exe，classic 是 Teams.exe。
@@ -280,6 +285,31 @@ def _iter_controls(root, max_depth: int = 14, max_nodes: int = 6000):
             queue.append((child, depth + 1))
 
 
+def control_evidence(node, max_depth: int = 4) -> list[str]:
+    """收集会话项自身及其子控件上所有可读的标识文本。
+
+    未读蓝点没有文字，但承载它的控件往往在 Name / AutomationId / ClassName
+    或无障碍描述里留下线索，所以这几处都要收。
+    """
+    parts: list[str] = []
+    for sub, _depth in _iter_controls(node, max_depth=max_depth, max_nodes=200):
+        for attr in ("Name", "AutomationId", "ClassName"):
+            try:
+                value = getattr(sub, attr, "") or ""
+            except Exception:
+                continue
+            if value:
+                parts.append(str(value))
+        try:                                   # 无障碍描述里有时才写着“未读”
+            legacy = sub.GetLegacyIAccessiblePattern()
+            for value in (legacy.Description, legacy.Value):
+                if value:
+                    parts.append(str(value))
+        except Exception:
+            pass
+    return parts
+
+
 def find_unread_items(teams_win) -> list:
     """在 Teams 窗口里找出所有带未读标记的会话项。"""
     unread = []
@@ -287,19 +317,27 @@ def find_unread_items(teams_win) -> list:
     for node, _depth in _iter_controls(teams_win):
         try:
             ctrl_type = node.ControlTypeName
-            name = node.Name or ""
+            name = (node.Name or "").strip()
         except Exception:
             continue
         if ctrl_type not in ("ListItemControl", "TreeItemControl", "ButtonControl"):
             continue
+        if not name:
+            continue
+
+        # 先看会话项自己的名字，再看子控件——蓝点的标记只会出现在后者。
         hit = _match_unread(name)
         if not hit:
+            for evidence in control_evidence(node):
+                hit = _match_unread(evidence)
+                if hit:
+                    break
+        if not hit:
             continue
-        key = name.strip()
-        if key in seen:
+        if name in seen:
             continue
-        seen.add(key)
-        unread.append((node, name.strip(), hit))
+        seen.add(name)
+        unread.append((node, name, hit))
     return unread
 
 
@@ -378,6 +416,46 @@ def collect_unread_windows(teams_win, open_each: bool = True) -> list[dict]:
     return results
 
 
+def dump_chat_items(teams_win, path: str) -> None:
+    """只导出会话列表项及其子控件的全部属性。
+
+    未读检测不生效时用这个：在文件里找到那个确实有新消息的会话，
+    看它比已读会话多出哪个子控件 / 多出哪个属性值，那就是未读标记。
+    """
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"会话列表导出时间：{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        fh.write(f"窗口：{teams_win.Name}\n")
+        fh.write("每个会话项下面缩进的是它的子控件；未读标记通常藏在子控件里。\n\n")
+        count = 0
+        for node, _depth in _iter_controls(teams_win):
+            try:
+                if node.ControlTypeName not in ("ListItemControl", "TreeItemControl"):
+                    continue
+                name = (node.Name or "").strip()
+            except Exception:
+                continue
+            if not name:
+                continue
+            count += 1
+            matched = _match_unread(name) or "（自身名称无未读特征）"
+            fh.write(f"[会话 {count}] {name}\n")
+            fh.write(f"    自身名称匹配：{matched}\n")
+            for sub, depth in _iter_controls(node, max_depth=4, max_nodes=200):
+                if sub is node:
+                    continue
+                try:
+                    parts = [f"type={sub.ControlTypeName}"]
+                    for attr in ("Name", "AutomationId", "ClassName"):
+                        value = getattr(sub, attr, "") or ""
+                        if value:
+                            parts.append(f"{attr}={value!r}")
+                except Exception:
+                    continue
+                fh.write(f"    {'  ' * depth}{' '.join(parts)}\n")
+            fh.write("\n")
+    log(f"会话列表已导出（{count} 个会话）：{path}")
+
+
 def dump_control_tree(teams_win, path: str) -> None:
     """把 Teams 窗口的控件树导出到文件，用来对照实际界面调匹配规则。
 
@@ -448,6 +526,8 @@ def run_once(args, pyautogui, output_path: str) -> None:
             return
         if args.dump_tree:
             dump_control_tree(teams_win, args.dump_tree)
+        if args.dump_chats:
+            dump_chat_items(teams_win, args.dump_chats)
         entries = collect_unread_windows(teams_win, open_each=not args.no_open)
         if entries:
             append_report(output_path, entries)
@@ -484,7 +564,9 @@ def main() -> int:
     parser.add_argument("--window-title", default=None,
                         help="按标题关键词强制指定 Teams 窗口（默认按进程名 ms-teams.exe 匹配）")
     parser.add_argument("--dump-tree", default=None, metavar="PATH",
-                        help="把 Teams 控件树导出到文件，用于排查未读检测不生效的问题")
+                        help="把 Teams 整棵控件树导出到文件")
+    parser.add_argument("--dump-chats", default=None, metavar="PATH",
+                        help="只导出会话列表项及其子控件属性，排查未读检测优先用这个")
     args = parser.parse_args()
 
     output_path = make_output_path(args.output)

@@ -364,6 +364,38 @@ def warm_up_uia_tree(teams_win) -> int:
     return count
 
 
+# Teams 把会话类型、未读状态、在线状态都拼进了控件名，例如
+# "未读消息 群组聊天 口岸GTW测试交流群 已静音"。判断未读要用原始名，
+# 但写进结果文件时得把这些装饰去掉，否则很难读。
+NAME_PREFIXES = ("未读消息", "群组聊天", "会议聊天", "聊天", "Unread", "Group chat", "Meeting chat", "Chat")
+NAME_SUFFIXES = ("有空", "离开", "忙碌", "请勿打扰", "通话中", "已静音", "脱机", "显示为脱机",
+                 "未知", "Available", "Away", "Busy", "Do not disturb", "Muted", "Offline")
+
+# 列表里混进来的非会话项。
+NON_CHAT_NAMES = {"查看更多", "显示更多", "更多选项", "See more", "Show more", "更多"}
+
+
+def clean_chat_name(name: str) -> str:
+    """去掉会话名前后的类型标签和在线状态，只留会话本身的名字。"""
+    text = " ".join(name.split())
+    changed = True
+    while changed:
+        changed = False
+        for prefix in NAME_PREFIXES:
+            if text.startswith(prefix + " "):
+                text = text[len(prefix) + 1:].strip()
+                changed = True
+        for suffix in NAME_SUFFIXES:
+            if text.endswith(" " + suffix):
+                text = text[: -len(suffix) - 1].strip()
+                changed = True
+    return text or name.strip()
+
+
+# 左侧会话列表和右侧消息区的分界线，取窗口宽度的这个比例。
+PANEL_DIVIDER = 0.45
+
+
 # 会话项可能是这些类型里的任何一种，取决于 Teams 版本怎么搭的界面。
 CHAT_ITEM_TYPES = (
     "ListItemControl", "TreeItemControl", "DataItemControl",
@@ -438,11 +470,13 @@ def rect_of(node) -> tuple[int, int, int, int] | None:
     return box
 
 
-def pick_chat_list(items: list[dict], window_rect: tuple[int, int, int, int] | None) -> list[dict]:
-    """从所有列表项里挑出左侧会话列表那一组。
+def pick_chat_list(items: list[dict], window_rect: tuple[int, int, int, int] | None,
+                   side: str = "left") -> list[dict]:
+    """从所有列表项里挑出同属一组、且落在窗口指定一侧的那一批。
 
     Teams 窗口里 ListItem 到处都是（工具栏、下拉菜单等），只看控件类型会混进
-    一堆无关项。会话列表的特征是：同一个父控件下挂着多个项，且都在窗口左半边。
+    一堆无关项。真正的列表特征是：同一个父控件下挂着多个项，且集中在某一侧
+    ——会话列表在左边（side="left"），消息条目在右边（side="right"）。
 
     items 每项形如 {'name':…, 'rect':…, 'parent':…}，纯数据，方便离线测试。
     """
@@ -458,14 +492,18 @@ def pick_chat_list(items: list[dict], window_rect: tuple[int, int, int, int] | N
         score = len(members)
         if window_rect is not None:
             win_left, _, win_right, _ = window_rect
-            half = win_left + (win_right - win_left) / 2
-            in_left = sum(
-                1 for m in members
-                if m["rect"] is not None and m["rect"][0] < half
-            )
-            if in_left < len(members) / 2:          # 多数不在左半边，不是会话列表
+            # 和 read_messages_of_current_chat 里的分界线保持一致：
+            # 左右两侧用同一个 0.45，否则会出现"过了这道线却没过那道线"的漏判。
+            divider = win_left + (win_right - win_left) * PANEL_DIVIDER
+            if side == "right":
+                on_side = sum(1 for m in members
+                              if m["rect"] is not None and m["rect"][0] >= divider)
+            else:
+                on_side = sum(1 for m in members
+                              if m["rect"] is not None and m["rect"][0] < divider)
+            if on_side < len(members) / 2:          # 多数不在这一侧，不是要找的那组
                 continue
-            score += in_left
+            score += on_side
         if score > best_score:
             best, best_score = members, score
     return best
@@ -487,6 +525,34 @@ def is_accent_pixel(r: int, g: int, b: int) -> bool:
 def count_accent_pixels(pixels: list[tuple[int, int, int]]) -> int:
     """统计一批像素里有多少个是强调色，供圆点检测使用。"""
     return sum(1 for px in pixels if is_accent_pixel(*px[:3]))
+
+
+def looks_like_dot(pixels: list[tuple[int, int, int]], width: int) -> bool:
+    """判断这片像素里有没有一个"紧凑的圆斑"。
+
+    只数蓝色像素的个数太松了：头像、彩色图标、选中态背景都能凑够数量，
+    实测会把大半个列表误判成未读。未读圆点的特征是又小又圆又实心，
+    所以要看它的外接矩形是不是接近正方形、里面填得满不满。
+    """
+    if width <= 0:
+        return False
+    coords = [
+        (i % width, i // width)
+        for i, px in enumerate(pixels)
+        if is_accent_pixel(*px[:3])
+    ]
+    if not (8 <= len(coords) <= 600):               # 太少是噪点，太多是色块背景
+        return False
+
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    box_w = max(xs) - min(xs) + 1
+    box_h = max(ys) - min(ys) + 1
+    if not (3 <= box_w <= 26 and 3 <= box_h <= 26):  # 圆点就这么大
+        return False
+    if max(box_w, box_h) > min(box_w, box_h) * 1.8:  # 长条形不是圆点
+        return False
+    return len(coords) >= box_w * box_h * 0.45       # 实心，不是散点
 
 
 def signature_outliers(signatures: list[tuple[str, tuple]]) -> set[str]:
@@ -560,18 +626,21 @@ def detect_dot(node, pyautogui) -> bool:
     if width < 40 or height < 10:
         return False
 
-    # 只看右边 25%，头像和文字都在左边，避免误判。
+    # 只看右边 25% 的垂直中段：头像和文字在左边，上下边缘可能压到相邻行。
     strip_left = left + int(width * 0.75)
+    strip_width = right - strip_left
+    band_top = top + int(height * 0.2)
+    band_height = max(1, int(height * 0.6))
     try:
-        shot = pyautogui.screenshot(region=(strip_left, top, right - strip_left, height))
+        shot = pyautogui.screenshot(region=(strip_left, band_top, strip_width, band_height))
         pixels = list(shot.convert("RGB").getdata())
     except Exception:
         return False
-    return count_accent_pixels(pixels) >= 12        # 圆点大概十几到几十个像素
+    return looks_like_dot(pixels, strip_width)
 
 
 def find_unread_items(teams_win, auto=None, pyautogui=None,
-                      strategies: tuple[str, ...] = ("text", "bold", "dot", "structure"),
+                      strategies: tuple[str, ...] = ("text", "bold", "structure"),
                       debug: bool = False) -> list:
     """在 Teams 窗口里找出所有带未读标记的会话项。
 
@@ -599,7 +668,7 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
                 if not accept(node):
                     continue
                 name = derive_name(node)
-                if not name:
+                if not name or name.strip() in NON_CHAT_NAMES:
                     continue
                 parent = node.GetParentControl()
                 parent_key = parent.GetRuntimeId() if parent else None
@@ -607,7 +676,8 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
                 continue
             found.append({
                 "node": node,
-                "name": name,
+                "name": name,                       # 原始名，判断未读用
+                "display": clean_chat_name(name),   # 清理过的名字，写文件用
                 "rect": rect_of(node),
                 "parent": tuple(parent_key) if parent_key else None,
             })
@@ -679,7 +749,7 @@ def find_unread_items(teams_win, auto=None, pyautogui=None,
         if not reasons or name in seen:
             continue
         seen.add(name)
-        unread.append((node, name, "、".join(reasons)))
+        unread.append((node, item["display"], "、".join(reasons)))
     return unread
 
 
@@ -689,55 +759,62 @@ def read_messages_of_current_chat(teams_win, limit: int = 30) -> list[str]:
     Teams 把消息暴露成一组 ListItem / Group，控件名里通常已经带上
     “某某 说 内容 时间”这样的可访问性描述，直接取名称即可。
     """
-    named_container = None      # 名称里带“消息 / message”的容器，优先级最高
-    biggest_container = None    # 兜底：子控件最多的容器
-    biggest_count = 0
+    window_rect = rect_of(teams_win)
+    if window_rect is None:
+        return []
+    win_left, _win_top, win_right, _win_bottom = window_rect
+    win_width = win_right - win_left
+    if win_width <= 0:
+        return []
+    # 左侧是会话列表，消息在右边，用这条界线把两者分开。
+    divider = win_left + win_width * PANEL_DIVIDER
 
+    candidates = []
     for node, _depth in _iter_controls(teams_win):
         try:
-            if node.ControlTypeName not in ("ListControl", "GroupControl", "TableControl"):
+            if node.ControlTypeName not in ("ListItemControl", "DataItemControl", "GroupControl"):
                 continue
-            name = (node.Name or "").lower()
-            children = node.GetChildren()
         except Exception:
             continue
-        if not children:
+        rect = rect_of(node)
+        if rect is None or rect[0] < divider:       # 落在左侧面板的一律不要
             continue
-        if named_container is None and any(
-            k in name for k in ("message", "消息", "conversation", "会话")
-        ):
-            named_container = node
-        if len(children) > biggest_count:
-            biggest_container, biggest_count = node, len(children)
+        name = derive_name(node)
+        if not name:
+            continue
+        try:
+            parent = node.GetParentControl()
+            parent_key = parent.GetRuntimeId() if parent else None
+        except Exception:
+            parent_key = None
+        candidates.append({
+            "name": re.sub(r"\s+", " ", name),
+            "rect": rect,
+            "parent": tuple(parent_key) if parent_key else None,
+        })
 
-    container = named_container or biggest_container
-    if container is None:
+    if not candidates:
         return []
 
+    # 消息条目都挂在同一个父控件下，取最大的那一组，避免混进工具栏、输入框。
+    rows = pick_chat_list(candidates, window_rect, side="right") or candidates
+    rows.sort(key=lambda item: item["rect"][1])     # 按纵坐标排，还原成对话顺序
+
     messages: list[str] = []
-    for child in container.GetChildren():
-        try:
-            text = (child.Name or "").strip()
-        except Exception:
+    for row in rows:
+        text = row["name"]
+        # 外层容器的名字常常是内层几条拼起来的，去掉这种包含关系的重复。
+        if messages and (text in messages[-1] or messages[-1] in text):
+            if len(text) > len(messages[-1]):
+                messages[-1] = text
             continue
-        if not text:
-            # 名称为空时，向下再取一层子控件的文本拼起来。
-            try:
-                text = " ".join(
-                    (g.Name or "").strip()
-                    for g in child.GetChildren()
-                    if (g.Name or "").strip()
-                ).strip()
-            except Exception:
-                text = ""
-        if text:
-            messages.append(re.sub(r"\s+", " ", text))
+        messages.append(text)
 
     return messages[-limit:]
 
 
 def collect_unread_windows(teams_win, open_each: bool = True, auto=None, pyautogui=None,
-                           strategies: tuple[str, ...] = ("text", "bold", "dot", "structure"),
+                           strategies: tuple[str, ...] = ("text", "bold", "structure"),
                            debug: bool = False) -> list[dict]:
     """返回 [{'chat': 会话标题, 'badge': 未读标记, 'messages': [...]}, ...]"""
     results = []
@@ -927,8 +1004,9 @@ def main() -> int:
     parser.add_argument("--dump-chats", default=None, metavar="PATH",
                         help="只导出会话列表项及其子控件属性，排查未读检测优先用这个")
     parser.add_argument("--detect", type=parse_strategies,
-                        default=("text", "bold", "dot", "structure"),
-                        help="未读判断方式，逗号分隔：text,bold,dot,structure（默认全开）")
+                        default=("text", "bold", "structure"),
+                        help="未读判断方式，逗号分隔：text,bold,dot,structure"
+                             "（默认 text,bold,structure；dot 误报多，需要时再手动加上）")
     parser.add_argument("--debug-detect", action="store_true",
                         help="逐个打印每个会话项的判断结果和依据")
     args = parser.parse_args()
